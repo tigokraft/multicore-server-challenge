@@ -721,6 +721,12 @@ int main(int argc, char **argv) {
     // connection: at 10,000 users x0.1, p95 465-477 -> 429-432 ms, p99 515-525 -> 456-466 ms, same req/s.
     // 2-4 starve the backends (-4..-7% req/s while the loop refills them); 16..64 are equivalent.
     CFG.pg_depth = env_int("PG_DEPTH", 16);
+    CFG.batch = getenv("BATCH") ? atoi(getenv("BATCH")) : 1;
+    CFG.batch_max = getenv("BATCH_MAX") ? atoi(getenv("BATCH_MAX")) : 32;
+    if (CFG.batch_max < 1) CFG.batch_max = 1;
+    if (CFG.batch_max > 64) CFG.batch_max = 64;
+    CFG.batch_hold = getenv("BATCH_HOLD") ? atoi(getenv("BATCH_HOLD")) : 1;
+    if (CFG.batch_hold < 1) CFG.batch_hold = 1;
     CFG.bcrypt_wait_ms = getenv("BCRYPT_WAIT_MS") ? atoi(getenv("BCRYPT_WAIT_MS")) : 150;
     if (CFG.bcrypt_lanes > BC_LANES) CFG.bcrypt_lanes = BC_LANES;
     // Session settings on our own connections. force_generic_plan: every prepared statement keeps one plan

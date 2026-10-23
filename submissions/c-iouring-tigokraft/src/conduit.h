@@ -90,6 +90,7 @@ typedef struct {
     char *host, *port;
     char *pg_session; // extra session settings sent at startup: name=value,name=value
     int threads, db_conns, bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms, pg_depth;
+    int batch, batch_max, batch_hold;
     hmac_key_t jwt_key;
 } config_t;
 extern config_t CFG;
@@ -103,19 +104,32 @@ static inline str_t pgs(pgf_t f) { return f.n < 0 ? STR_NULL : (str_t){f.p, (siz
 
 struct req;
 struct pgconn;
+struct worker;
 #define PG_MAXST 6
 typedef struct pgbatch {
     struct pgbatch *next;
+    struct pgbatch *qnext; // link for per-statement batch queue
     struct req *req;
     void (*cb)(struct req *, struct pgbatch *);
     struct pgconn *conn; // NULL while the batch waits in the worker's queue
+    struct worker *w;    // worker owning this batch (used by carrier completion)
     buf_t *buf, own;     // where its messages are built: the connection's output, or `own` while queued
+    const str_t *params; // copied member params
+    struct pgbatch **members; // carrier: array of member batch pointers
     int nst, cur;
-    bool failed, is_write, behind_w; // is_write/behind_w/t_enq: STATS=1 only
+    int stmt;            // carrier: statement index
+    int nmembers;        // carrier: member count
+    bool failed, is_write, behind_w, is_carrier; // is_write/behind_w/t_enq: STATS=1 only
     uint64_t t_enq;
     char sqlstate[6];
     pgst_t st[PG_MAXST];
 } pgbatch_t;
+
+typedef struct pgpool {
+    pgbatch_t *head, *tail;
+    int count;
+    int inflight;
+} pgpool_t;
 
 typedef struct pgconn {
     int fd;
@@ -138,6 +152,11 @@ void pg_connect(pgconn_t *c, struct worker *w); // blocking: startup, auth, prep
 pgbatch_t *pg_begin(struct req *r, void (*cb)(struct req *, pgbatch_t *));
 void pg_stmt(pgbatch_t *b, int stmt, const str_t *params);
 void pg_end(pgbatch_t *b);
+// Batches identical read statements across requests on the same worker into a single Postgres execution.
+// The prepared statement parameters must all be arrays (int8[] or text[]); column 0 is the 1-based member
+// position in those arrays. params holds one scalar value per statement parameter (p == NULL for SQL NULL).
+// Each request receives only its own rows in st[0] without column 0.
+void pg_batched(struct req *r, int stmt, const str_t *params, void (*cb)(struct req *, pgbatch_t *));
 void pg_flush(pgconn_t *c);
 void pg_on_send(pgconn_t *c, int res);
 void pg_on_recv(pgconn_t *c, int res);
@@ -182,6 +201,7 @@ typedef struct worker {
     int npg;
     pgbatch_t *wq_head, *wq_tail; // batches waiting for a pipeline slot, oldest first
     int wq_n;
+    pgpool_t *pools; // per-statement batch pools
     int efd;
     uint64_t efd_val;
     pthread_mutex_t mu;

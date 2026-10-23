@@ -284,6 +284,14 @@ void pg_connect(pgconn_t *c, worker_t *w) {
 
 static const char SYNC[5] = {'S', 0, 0, 0, 4};
 
+static pgconn_t *pg_choose_conn(worker_t *w) {
+    if (w->wq_head) return NULL;
+    pgconn_t *best = &w->pg[0];
+    for (int i = 1; i < w->npg; i++)
+        if (w->pg[i].inflight < best->inflight) best = &w->pg[i];
+    return best->inflight < CFG.pg_depth ? best : NULL;
+}
+
 // A connection carries at most CFG.pg_depth batches at a time; the rest wait in the worker's FIFO queue and go
 // out, oldest first, as replies free slots. A batch built while a connection has room (and nothing is queued)
 // is written straight into that connection's output buffer; otherwise into its own buffer until it is placed.
@@ -294,14 +302,10 @@ pgbatch_t *pg_begin(req_t *r, void (*cb)(req_t *, pgbatch_t *)) {
     b->req = r;
     b->cb = cb;
     b->buf = &b->own;
-    if (!w->wq_head) {
-        pgconn_t *best = &w->pg[0];
-        for (int i = 1; i < w->npg; i++)
-            if (w->pg[i].inflight < best->inflight) best = &w->pg[i];
-        if (best->inflight < CFG.pg_depth) {
-            b->conn = best;
-            b->buf = &best->out;
-        }
+    pgconn_t *c = pg_choose_conn(w);
+    if (c) {
+        b->conn = c;
+        b->buf = &c->out;
     }
     return b;
 }
@@ -343,19 +347,150 @@ static void pg_link(pgconn_t *c, pgbatch_t *b) {
     if (UNLIKELY(STATS_ON)) stats_pg_enq(c, b);
 }
 
-void pg_end(pgbatch_t *b) {
+static void pg_queue_batch(worker_t *w, pgbatch_t *b) {
     buf_put(b->buf, SYNC, sizeof SYNC);
     if (UNLIKELY(STATS_ON)) b->t_enq = stats_now();
     if (b->conn) {
         pg_link(b->conn, b);
         return;
     }
-    worker_t *w = b->req->w;
     b->next = NULL;
     if (w->wq_tail) w->wq_tail->next = b;
     else w->wq_head = b;
     w->wq_tail = b;
     w->wq_n++;
+}
+
+void pg_end(pgbatch_t *b) {
+    pg_queue_batch(b->req->w, b);
+}
+
+// ---------- cross-request batched statements ----------
+
+static void pg_carrier_done(req_t *r, pgbatch_t *b);
+static void pg_flush_pool(worker_t *w, int stmt);
+
+static void buf_pg_array_elem(buf_t *b, str_t s) {
+    if (!s.p) {
+        buf_lit(b, "NULL");
+        return;
+    }
+    buf_putc(b, '"');
+    for (size_t i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c == '"' || c == '\\') buf_putc(b, '\\');
+        buf_putc(b, c);
+    }
+    buf_putc(b, '"');
+}
+
+static void pg_flush_pool(worker_t *w, int stmt) {
+    if (!w->pools) return;
+    pgpool_t *pool = &w->pools[stmt];
+    int nparams = STMTS[stmt].nparams;
+    while (pool->head && pool->inflight < CFG.batch_hold) {
+        int count = pool->count < CFG.batch_max ? pool->count : CFG.batch_max;
+        pgbatch_t **members = malloc(count * sizeof *members);
+        if (!members) die("out of memory");
+        for (int i = 0; i < count; i++) {
+            pgbatch_t *m = pool->head;
+            pool->head = m->qnext;
+            if (!pool->head) pool->tail = NULL;
+            pool->count--;
+            m->qnext = NULL;
+            members[i] = m;
+        }
+        pool->inflight++;
+
+        pgbatch_t *carrier = calloc(1, sizeof *carrier);
+        if (!carrier) die("out of memory");
+        carrier->cb = pg_carrier_done;
+        carrier->is_carrier = true;
+        carrier->stmt = stmt;
+        carrier->w = w;
+        carrier->nmembers = count;
+        carrier->members = members;
+        carrier->buf = &carrier->own;
+
+        pgconn_t *c = pg_choose_conn(w);
+        if (c) {
+            carrier->conn = c;
+            carrier->buf = &c->out;
+        }
+
+        buf_t abufs[nparams > 0 ? nparams : 1];
+        str_t aparams[nparams > 0 ? nparams : 1];
+        for (int j = 0; j < nparams; j++) {
+            abufs[j] = (buf_t){0};
+            buf_putc(&abufs[j], '{');
+            for (int i = 0; i < count; i++) {
+                if (i > 0) buf_putc(&abufs[j], ',');
+                buf_pg_array_elem(&abufs[j], members[i]->params[j]);
+            }
+            buf_putc(&abufs[j], '}');
+            aparams[j] = (str_t){abufs[j].p, abufs[j].len};
+        }
+
+        pg_stmt(carrier, stmt, aparams);
+        for (int j = 0; j < nparams; j++) buf_free(&abufs[j]);
+
+        pg_queue_batch(w, carrier);
+    }
+}
+
+static void pg_carrier_done(req_t *r, pgbatch_t *b) {
+    (void)r;
+    worker_t *w = b->w;
+    int stmt = b->stmt;
+    for (int i = 0; i < b->nmembers; i++) {
+        pgbatch_t *m = b->members[i];
+        m->conn = b->conn;
+        m->failed = b->failed;
+        memcpy(m->sqlstate, b->sqlstate, sizeof m->sqlstate);
+        m->cur = b->cur;
+        m->cb(m->req, m);
+    }
+    free(b->members);
+    buf_free(&b->own);
+    free(b);
+
+    if (w->pools) {
+        pgpool_t *pool = &w->pools[stmt];
+        pool->inflight--;
+        pg_flush_pool(w, stmt);
+    }
+}
+
+void pg_batched(req_t *r, int stmt, const str_t *params, void (*cb)(req_t *, pgbatch_t *)) {
+    worker_t *w = r->w;
+    if (UNLIKELY(!w->pools)) {
+        w->pools = calloc(NSTMTS, sizeof *w->pools);
+        if (!w->pools) die("out of memory");
+    }
+    pgpool_t *pool = &w->pools[stmt];
+
+    pgbatch_t *b = arena_alloc(&r->arena, sizeof *b);
+    memset(b, 0, sizeof *b);
+    b->req = r;
+    b->cb = cb;
+    b->nst = 1;
+    b->cur = 0;
+    b->stmt = stmt;
+
+    int nparams = STMTS[stmt].nparams;
+    if (nparams > 0) {
+        str_t *cp = arena_alloc(&r->arena, nparams * sizeof *cp);
+        memcpy(cp, params, nparams * sizeof *cp);
+        b->params = cp;
+    }
+
+    b->qnext = NULL;
+    if (pool->tail) pool->tail->qnext = b;
+    else pool->head = b;
+    pool->tail = b;
+    pool->count++;
+
+    if (pool->inflight < CFG.batch_hold) pg_flush_pool(w, stmt);
 }
 
 // Moves queued batches onto `c` while it has room.
@@ -408,24 +543,20 @@ void pg_arm_recv(pgconn_t *c) {
     io_uring_sqe_set_data64(sqe, UD(c, UD_PGRECV));
 }
 
-static void on_datarow(pgbatch_t *b, const char *body, uint32_t len) {
-    if (b->failed || b->cur >= PG_MAXST) return;
-    arena_t *a = &b->req->arena;
-    pgst_t *st = &b->st[b->cur];
-    int ncols = get16(body);
+static void pg_append_row(arena_t *a, pgst_t *st, int ncols, const char *raw_cols, size_t raw_len) {
     if (st->nrows == 0) st->ncols = ncols;
-    if ((size_t)(st->nrows + 1) * ncols > st->cap) {
+    if ((size_t)(st->nrows + 1) * (size_t)ncols > st->cap) {
         size_t cap = st->cap ? st->cap * 2 : (size_t)ncols * 4;
-        while (cap < (size_t)(st->nrows + 1) * ncols) cap *= 2;
+        while (cap < (size_t)(st->nrows + 1) * (size_t)ncols) cap *= 2;
         pgf_t *f = arena_alloc(a, cap * sizeof *f);
-        if (st->f) memcpy(f, st->f, (size_t)st->nrows * ncols * sizeof *f);
+        if (st->f) memcpy(f, st->f, (size_t)st->nrows * (size_t)ncols * sizeof *f);
         st->f = f;
         st->cap = cap;
     }
-    char *copy = arena_alloc(a, len);
-    memcpy(copy, body, len);
-    const char *p = copy + 2;
-    pgf_t *row = st->f + (size_t)st->nrows * ncols;
+    char *copy = arena_alloc(a, raw_len);
+    memcpy(copy, raw_cols, raw_len);
+    const char *p = copy;
+    pgf_t *row = st->f + (size_t)st->nrows * (size_t)ncols;
     for (int i = 0; i < ncols; i++) {
         int32_t n = (int32_t)get32(p);
         p += 4;
@@ -434,6 +565,27 @@ static void on_datarow(pgbatch_t *b, const char *body, uint32_t len) {
         if (n > 0) p += n;
     }
     st->nrows++;
+}
+
+static void on_datarow(pgbatch_t *b, const char *body, uint32_t len) {
+    if (b->failed) return;
+    int ncols = get16(body);
+    if (b->is_carrier) {
+        if (ncols < 2 || len < 6) return;
+        int32_t pos_len = (int32_t)get32(body + 2);
+        if (pos_len <= 0 || (size_t)len < 6 + (size_t)pos_len) return;
+        const char *pos_str = body + 6;
+        int64_t pos;
+        if (!parse_uint(pos_str, (size_t)pos_len, &pos)) return;
+        if (pos < 1 || pos > (int64_t)b->nmembers) return;
+        pgbatch_t *m = b->members[pos - 1];
+        if (!m || m->failed) return;
+        const char *p = pos_str + pos_len;
+        pg_append_row(&m->req->arena, &m->st[0], ncols - 1, p, (size_t)((body + len) - p));
+        return;
+    }
+    if (b->cur >= PG_MAXST || len < 2) return;
+    pg_append_row(&b->req->arena, &b->st[b->cur], ncols, body + 2, (size_t)(len - 2));
 }
 
 void pg_on_recv(pgconn_t *c, int res) {
