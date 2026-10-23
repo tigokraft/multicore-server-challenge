@@ -384,11 +384,13 @@ static void buf_pg_array_elem(buf_t *b, str_t s) {
     buf_putc(b, '"');
 }
 
+// A full batch (batch_max members) goes out at once whatever is in flight; a partial batch goes out only
+// while fewer than batch_hold carriers are in flight, else it waits for one to complete. All carriers count.
 static void pg_flush_pool(worker_t *w, int stmt) {
     if (!w->pools) return;
     pgpool_t *pool = &w->pools[stmt];
     int nparams = STMTS[stmt].nparams;
-    while (pool->head && pool->inflight < CFG.batch_hold) {
+    while (pool->head && (pool->count >= CFG.batch_max || pool->inflight < CFG.batch_hold)) {
         int count = pool->count < CFG.batch_max ? pool->count : CFG.batch_max;
         pgbatch_t **members = malloc(count * sizeof *members);
         if (!members) die("out of memory");
@@ -497,7 +499,7 @@ void pg_batched(req_t *r, int stmt, int single_stmt, const str_t *params, void (
     pool->tail = b;
     pool->count++;
 
-    if (pool->inflight < CFG.batch_hold) pg_flush_pool(w, stmt);
+    pg_flush_pool(w, stmt);
 }
 
 // Moves queued batches onto `c` while it has room.
