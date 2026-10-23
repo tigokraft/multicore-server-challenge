@@ -6,6 +6,7 @@
 #include <time.h>
 
 #define INT8 20
+#define INT8ARR 1016
 #define TEXT 25
 #define TEXTARR 1009
 
@@ -16,6 +17,7 @@ enum {
     S_ARTICLE_BY_SLUG, S_ARTICLE_LAST, S_INSERT_ARTICLE, S_INSERT_TAGS, S_INSERT_ARTICLE_TAGS,
     S_ARTICLE_AUTHOR, S_UPDATE_ARTICLE, S_DELETE_ARTICLE, S_FAVORITE, S_UNFAVORITE,
     S_COMMENTS, S_CREATE_COMMENT, S_COMMENT_AUTHOR, S_DELETE_COMMENT,
+    S_LIST_ALL_B, S_LIST_TAG_B,
     S__COUNT
 };
 
@@ -125,6 +127,73 @@ const stmt_def_t STMTS[] = {
                           "WHERE c.id = $1 AND a.slug = $2", 2, {INT8, TEXT}},
     [S_DELETE_COMMENT] = {"DELETE FROM comments c USING articles a WHERE c.id = $1 AND a.id = c.article_id "
                           "AND a.slug = $2 AND c.author_id = $3", 3, {INT8, TEXT, INT8}},
+
+    // Batched forms of the two lists, one execution per group of waiting requests, sharing the count,
+    // the pages and the per-article enrichment inside that execution; viewer flags per request;
+    // designed and checked in the v2 work.
+    [S_LIST_ALL_B] = {
+        "WITH pgm AS MATERIALIZED ( "
+        "  SELECT r.k, r.v, x.id "
+        "  FROM unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(v, l, o, k) "
+        "  LEFT JOIN LATERAL (SELECT a.id FROM (SELECT a.id FROM articles a ORDER BY a.id DESC OFFSET r.o LIMIT 100) a LIMIT r.l) x ON true "
+        "), vw AS MATERIALIZED ( "
+        "  SELECT array_agg(DISTINCT v) AS arr FROM pgm WHERE v <> 0 "
+        "), tn AS MATERIALIZED ( "
+        "  SELECT id, name FROM tags "
+        "), ids AS MATERIALIZED ( "
+        "  SELECT array_agg(DISTINCT id) AS arr FROM pgm "
+        "), art AS MATERIALIZED ( "
+        "  SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, u.username, u.bio, u.image, "
+        "         COALESCE(tg.names, '{}') AS tag_list, "
+        "         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count "
+        "  FROM ids JOIN articles a ON a.id = ANY(ids.arr) JOIN users u ON u.id = a.author_id "
+        "  LEFT JOIN (SELECT at.article_id, array_agg(t.name ORDER BY t.name)::text AS names FROM ids i2 JOIN article_tags at ON at.article_id = ANY(i2.arr) "
+        "             JOIN tn t ON t.id = at.tag_id GROUP BY at.article_id) tg ON tg.article_id = a.id "
+        ") "
+        "SELECT p.k::int AS k, cnt.n, e.slug, e.title, e.description, e.created_at, e.updated_at, "
+        "       COALESCE(e.tag_list, '{}') AS tag_list, COALESCE(e.favorites_count, 0) AS favorites_count, "
+        "       (p.v <> 0 AND COALESCE((p.v, e.id) IN (SELECT f.user_id, f.article_id FROM vw JOIN favorites f ON f.user_id = ANY(vw.arr)), false)) AS favorited, "
+        "       e.username, e.bio, e.image, "
+        "       (p.v <> 0 AND COALESCE((p.v, e.author_id) IN (SELECT fo.follower_id, fo.followee_id FROM vw JOIN follows fo ON fo.follower_id = ANY(vw.arr)), false)) AS following "
+        "FROM pgm p CROSS JOIN (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a OFFSET 999 LIMIT 1) THEN 1000 ELSE (SELECT count(*) FROM articles a) END AS n) cnt "
+        "LEFT JOIN art e ON e.id = p.id "
+        "ORDER BY p.k, p.id DESC",
+        3, {INT8ARR, INT8ARR, INT8ARR}},
+    [S_LIST_TAG_B] = {
+        "WITH req AS MATERIALIZED ( "
+        "  SELECT r.k, r.v, r.l, r.o, g.id AS tid "
+        "  FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::text[]) WITH ORDINALITY AS r(v, l, o, t, k) "
+        "  LEFT JOIN tags g ON g.name = r.t "
+        "), cnt AS MATERIALIZED ( "
+        "  SELECT d.tid, c.n "
+        "  FROM (SELECT DISTINCT tid FROM req WHERE tid IS NOT NULL) d "
+        "  CROSS JOIN LATERAL (SELECT CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = d.tid OFFSET 999 LIMIT 1) THEN 1000 ELSE (SELECT count(*) FROM article_tags at WHERE at.tag_id = d.tid) END AS n) c "
+        "), pgm AS MATERIALIZED ( "
+        "  SELECT q.k, q.v, COALESCE(c.n, 0) AS n, x.id "
+        "  FROM req q LEFT JOIN cnt c ON c.tid = q.tid "
+        "  LEFT JOIN LATERAL (SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = q.tid ORDER BY at.article_id DESC LIMIT q.l OFFSET q.o) x ON true "
+        "), vw AS MATERIALIZED ( "
+        "  SELECT array_agg(DISTINCT v) AS arr FROM pgm WHERE v <> 0 "
+        "), tn AS MATERIALIZED ( "
+        "  SELECT id, name FROM tags "
+        "), ids AS MATERIALIZED ( "
+        "  SELECT array_agg(DISTINCT id) AS arr FROM pgm "
+        "), art AS MATERIALIZED ( "
+        "  SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, u.username, u.bio, u.image, "
+        "         COALESCE(tg.names, '{}') AS tag_list, "
+        "         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count "
+        "  FROM ids JOIN articles a ON a.id = ANY(ids.arr) JOIN users u ON u.id = a.author_id "
+        "  LEFT JOIN (SELECT at.article_id, array_agg(t.name ORDER BY t.name)::text AS names FROM ids i2 JOIN article_tags at ON at.article_id = ANY(i2.arr) "
+        "             JOIN tn t ON t.id = at.tag_id GROUP BY at.article_id) tg ON tg.article_id = a.id "
+        ") "
+        "SELECT p.k::int AS k, p.n, e.slug, e.title, e.description, e.created_at, e.updated_at, "
+        "       COALESCE(e.tag_list, '{}') AS tag_list, COALESCE(e.favorites_count, 0) AS favorites_count, "
+        "       (p.v <> 0 AND COALESCE((p.v, e.id) IN (SELECT f.user_id, f.article_id FROM vw JOIN favorites f ON f.user_id = ANY(vw.arr)), false)) AS favorited, "
+        "       e.username, e.bio, e.image, "
+        "       (p.v <> 0 AND COALESCE((p.v, e.author_id) IN (SELECT fo.follower_id, fo.followee_id FROM vw JOIN follows fo ON fo.follower_id = ANY(vw.arr)), false)) AS following "
+        "FROM pgm p LEFT JOIN art e ON e.id = p.id "
+        "ORDER BY p.k, p.id DESC",
+        4, {INT8ARR, INT8ARR, INT8ARR, TEXTARR}},
 };
 const int NSTMTS = S__COUNT;
 
@@ -627,6 +696,16 @@ static void h_list(req_t *r) {
     if (query_get(r, "tag", &p[3]) && p[3].n) ls = S_LIST_TAG;
     else if (query_get(r, "author", &p[3]) && p[3].n) ls = S_LIST_AUTHOR;
     else if (query_get(r, "favorited", &p[3]) && p[3].n) ls = S_LIST_FAV;
+    if (CFG.batch) {
+        if (ls == S_LIST_ALL) {
+            pg_batched(r, S_LIST_ALL_B, -1, p, list_done);
+            return;
+        }
+        if (ls == S_LIST_TAG) {
+            pg_batched(r, S_LIST_TAG_B, S_LIST_TAG, p, list_done);
+            return;
+        }
+    }
     pgbatch_t *b = pg_begin(r, list_done);
     pg_stmt(b, ls, p);
     pg_end(b);

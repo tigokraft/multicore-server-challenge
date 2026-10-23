@@ -418,21 +418,26 @@ static void pg_flush_pool(worker_t *w, int stmt) {
             carrier->buf = &c->out;
         }
 
-        buf_t abufs[nparams > 0 ? nparams : 1];
-        str_t aparams[nparams > 0 ? nparams : 1];
-        for (int j = 0; j < nparams; j++) {
-            abufs[j] = (buf_t){0};
-            buf_putc(&abufs[j], '{');
-            for (int i = 0; i < count; i++) {
-                if (i > 0) buf_putc(&abufs[j], ',');
-                buf_pg_array_elem(&abufs[j], members[i]->params[j]);
+        if (count == 1 && pool->single_stmt != -1) {
+            carrier->is_single = true;
+            pg_stmt(carrier, pool->single_stmt, members[0]->params);
+        } else {
+            buf_t abufs[nparams > 0 ? nparams : 1];
+            str_t aparams[nparams > 0 ? nparams : 1];
+            for (int j = 0; j < nparams; j++) {
+                abufs[j] = (buf_t){0};
+                buf_putc(&abufs[j], '{');
+                for (int i = 0; i < count; i++) {
+                    if (i > 0) buf_putc(&abufs[j], ',');
+                    buf_pg_array_elem(&abufs[j], members[i]->params[j]);
+                }
+                buf_putc(&abufs[j], '}');
+                aparams[j] = (str_t){abufs[j].p, abufs[j].len};
             }
-            buf_putc(&abufs[j], '}');
-            aparams[j] = (str_t){abufs[j].p, abufs[j].len};
-        }
 
-        pg_stmt(carrier, stmt, aparams);
-        for (int j = 0; j < nparams; j++) buf_free(&abufs[j]);
+            pg_stmt(carrier, stmt, aparams);
+            for (int j = 0; j < nparams; j++) buf_free(&abufs[j]);
+        }
 
         pg_queue_batch(w, carrier);
     }
@@ -461,13 +466,15 @@ static void pg_carrier_done(req_t *r, pgbatch_t *b) {
     }
 }
 
-void pg_batched(req_t *r, int stmt, const str_t *params, void (*cb)(req_t *, pgbatch_t *)) {
+void pg_batched(req_t *r, int stmt, int single_stmt, const str_t *params, void (*cb)(req_t *, pgbatch_t *)) {
     worker_t *w = r->w;
     if (UNLIKELY(!w->pools)) {
         w->pools = calloc(NSTMTS, sizeof *w->pools);
         if (!w->pools) die("out of memory");
+        for (int i = 0; i < NSTMTS; i++) w->pools[i].single_stmt = -1;
     }
     pgpool_t *pool = &w->pools[stmt];
+    pool->single_stmt = single_stmt;
 
     pgbatch_t *b = arena_alloc(&r->arena, sizeof *b);
     memset(b, 0, sizeof *b);
@@ -571,6 +578,13 @@ static void on_datarow(pgbatch_t *b, const char *body, uint32_t len) {
     if (b->failed) return;
     int ncols = get16(body);
     if (b->is_carrier) {
+        if (b->is_single) {
+            if (len < 2) return;
+            pgbatch_t *m = b->members[0];
+            if (!m || m->failed) return;
+            pg_append_row(&m->req->arena, &m->st[0], ncols, body + 2, (size_t)(len - 2));
+            return;
+        }
         if (ncols < 2 || len < 6) return;
         int32_t pos_len = (int32_t)get32(body + 2);
         if (pos_len <= 0 || (size_t)len < 6 + (size_t)pos_len) return;

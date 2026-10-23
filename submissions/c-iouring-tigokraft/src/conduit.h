@@ -119,7 +119,7 @@ typedef struct pgbatch {
     int nst, cur;
     int stmt;            // carrier: statement index
     int nmembers;        // carrier: member count
-    bool failed, is_write, behind_w, is_carrier; // is_write/behind_w/t_enq: STATS=1 only
+    bool failed, is_write, behind_w, is_carrier, is_single; // is_write/behind_w/t_enq: STATS=1 only
     uint64_t t_enq;
     char sqlstate[6];
     pgst_t st[PG_MAXST];
@@ -129,6 +129,7 @@ typedef struct pgpool {
     pgbatch_t *head, *tail;
     int count;
     int inflight;
+    int single_stmt;
 } pgpool_t;
 
 typedef struct pgconn {
@@ -155,8 +156,9 @@ void pg_end(pgbatch_t *b);
 // Batches identical read statements across requests on the same worker into a single Postgres execution.
 // The prepared statement parameters must all be arrays (int8[] or text[]); column 0 is the 1-based member
 // position in those arrays. params holds one scalar value per statement parameter (p == NULL for SQL NULL).
-// Each request receives only its own rows in st[0] without column 0.
-void pg_batched(struct req *r, int stmt, const str_t *params, void (*cb)(struct req *, pgbatch_t *));
+// Each request receives only its own rows in st[0] without column 0. If a carrier has only one member and
+// single_stmt is not -1, that statement runs instead with the scalar params and rows are appended whole.
+void pg_batched(struct req *r, int stmt, int single_stmt, const str_t *params, void (*cb)(struct req *, pgbatch_t *));
 void pg_flush(pgconn_t *c);
 void pg_on_send(pgconn_t *c, int res);
 void pg_on_recv(pgconn_t *c, int res);
